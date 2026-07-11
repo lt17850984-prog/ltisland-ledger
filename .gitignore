@@ -1,0 +1,9 @@
+.DS_Store
+*.log
+node_modules/
+.env
+.env.*
+!.env.example
+# sealed/private material must never land in this public repo — nonces + full
+# pre-reveal signal data live only in the Hermes private repo (data/attestation/sealed/)
+sealed/
