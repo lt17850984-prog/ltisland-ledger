@@ -1,17 +1,34 @@
 #!/usr/bin/env python3
 """Standalone verifier for the LTIsland signal commitment ledger.
 
-No dependency on the Hermes private repo — pure Python stdlib. Anyone can
-run this against the JSON files in ingest/commits/ and ingest/reveals/ to
-independently confirm that revealed signals match what was committed
-beforehand, and that no committed signal in a date's set is missing from
-the merkle root.
+No dependency on the Hermes private repo — pure Python stdlib for the
+hash/merkle checks. Anyone can run this against the JSON files in
+ingest/commits/ and ingest/reveals/ to independently confirm that revealed
+signals match what was committed beforehand, and that no committed signal
+in a date's set is missing from the merkle root.
+
+RFC3161 timestamp check (added 2026-07-14): if ingest/commits/<date>.tsr and
+its paired ingest/commits/<date>.tsq exist, this script also shells out to
+the system `openssl` binary (must be installed separately — this is the
+one external dependency this script has, precisely because verifying a
+cryptographic timestamp token requires a certificate-chain-aware tool,
+which stdlib `ssl`/`hashlib` don't provide) to confirm the token is a valid
+RFC3161 response signed by a publicly-trusted CA (DigiCert or Sectigo — see
+"What actually proves the timing" below for why those two and not
+freetsa.org) covering exactly that day's merkle_root. Dates with
+tsa_status=="failed" in their commit JSON will not have a .tsr file — that
+is an expected, disclosed gap (see that field), not a bug in this script.
 
 Usage:
   python3 verify.py 2026-07-10
+  python3 verify.py 2026-07-10 --ca-bundle /path/to/ca-bundle.pem   # override CA bundle auto-detection
 """
+import argparse
 import hashlib
 import json
+import os
+import shutil
+import subprocess
 import sys
 
 
@@ -34,7 +51,78 @@ def merkle_root(hashes):
     return level[0]
 
 
-def verify(date_str):
+# Common system CA bundle locations, tried in order. This script has no pip
+# dependencies (not even `certifi`) on principle — see module docstring — so
+# instead of installing a portable CA bundle package, it just tries the
+# well-known paths for the most common platforms/package managers. If none
+# exist, pass --ca-bundle explicitly (openssl itself doesn't reliably fall
+# back to a built-in default across platforms for `ts -verify` — confirmed
+# by hand while building this feature: omitting -CAfile entirely fails with
+# "self-signed certificate in certificate chain" even when the OS trust
+# store is present, so a bundle path must always be supplied explicitly).
+_CA_BUNDLE_CANDIDATES = [
+    "/opt/homebrew/etc/openssl@3/cert.pem",   # macOS, Homebrew, Apple Silicon
+    "/usr/local/etc/openssl@3/cert.pem",      # macOS, Homebrew, Intel
+    "/etc/ssl/certs/ca-certificates.crt",     # Debian/Ubuntu
+    "/etc/pki/tls/certs/ca-bundle.crt",       # RHEL/CentOS/Fedora
+    "/etc/ssl/cert.pem",                      # Alpine, some BSDs
+]
+
+
+def _find_ca_bundle(override=None):
+    if override:
+        return override if os.path.exists(override) else None
+    for path in _CA_BUNDLE_CANDIDATES:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _verify_rfc3161(date_str, commit_doc, ca_bundle_override=None):
+    """Checks ingest/commits/<date>.tsr (+ its paired .tsq) against the
+    system openssl binary. Returns None if no token exists for this date
+    (expected when tsa_status=="failed" — not an error), True/False otherwise.
+    """
+    tsr_path = f"ingest/commits/{date_str}.tsr"
+    tsq_path = f"ingest/commits/{date_str}.tsr.tsq"
+    tsa_status = commit_doc.get("tsa_status")
+
+    if not (os.path.exists(tsr_path) and os.path.exists(tsq_path)):
+        if tsa_status == "ok":
+            print(f"  ⚠️ commit_doc claims tsa_status=ok but {tsr_path}/{tsq_path} "
+                  f"are missing — inconsistent, treat as unverified")
+            return False
+        print(f"RFC3161 timestamp: none for this date (tsa_status={tsa_status!r}, "
+              f"a disclosed gap — see that field in the commit JSON, not a bug here)")
+        return None
+
+    if not shutil.which("openssl"):
+        print("RFC3161 timestamp: token files present but `openssl` is not installed "
+              "on this machine — install it to verify (e.g. `brew install openssl` / "
+              "`apt install openssl`), skipping this check for now")
+        return None
+
+    ca_bundle = _find_ca_bundle(ca_bundle_override)
+    if not ca_bundle:
+        print("RFC3161 timestamp: token files present but no system CA bundle found "
+              "at any known path — pass --ca-bundle /path/to/bundle.pem to verify")
+        return None
+
+    result = subprocess.run(
+        ["openssl", "ts", "-verify", "-in", tsr_path, "-queryfile", tsq_path,
+         "-CAfile", ca_bundle, "-untrusted", ca_bundle],
+        capture_output=True, text=True,
+    )
+    ok = result.returncode == 0 and "Verification: OK" in result.stdout
+    provider = commit_doc.get("tsa_provider", "unknown")
+    print(f"RFC3161 timestamp ({provider}): {'OK' if ok else 'FAILED'}")
+    if not ok:
+        print(f"  openssl stdout: {result.stdout.strip()}")
+        print(f"  openssl stderr: {result.stderr.strip()}")
+    return ok
+
+
+def verify(date_str, ca_bundle_override=None):
     with open(f"ingest/commits/{date_str}.json", encoding="utf-8") as f:
         commit_doc = json.load(f)
 
@@ -48,6 +136,8 @@ def verify(date_str):
         print(f"  expected {commit_doc['merkle_root']}")
         print(f"  got      {recomputed_root}")
         sys.exit(1)
+
+    _verify_rfc3161(date_str, commit_doc, ca_bundle_override)
 
     try:
         with open(f"ingest/reveals/{date_str}.json", encoding="utf-8") as f:
@@ -73,7 +163,10 @@ def verify(date_str):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("usage: python3 verify.py YYYY-MM-DD")
-        sys.exit(1)
-    verify(sys.argv[1])
+    parser = argparse.ArgumentParser(usage="python3 verify.py YYYY-MM-DD [--ca-bundle PATH]")
+    parser.add_argument("date")
+    parser.add_argument("--ca-bundle", default=None,
+                         help="path to a CA bundle PEM for RFC3161 verification, "
+                              "if none of the common system paths apply to your machine")
+    args = parser.parse_args()
+    verify(args.date, ca_bundle_override=args.ca_bundle)
