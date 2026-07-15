@@ -29,6 +29,30 @@ stop-loss/take-profit levels — anything that would reveal the underlying
 strategy logic. The commitment only ever proves *that a signal existed*, not
 *why it was generated*.
 
+## Multiple independent time anchors
+
+Every day's `merkle_root` is anchored against three separate, independent
+mechanisms — losing any one of them doesn't invalidate the others, and none
+of them are required for the underlying hash/Merkle commitment to be valid
+math on its own:
+
+1. **GitHub push receipt** — when GitHub's servers actually received the
+   push carrying that day's commit file. External to anything the
+   publisher controls.
+2. **RFC3161 timestamp** (added 2026-07-14) — a public, CA-signed
+   timestamp token from a third-party Time-Stamp Authority (DigiCert
+   primary, Sectigo backup), obtained the same day the signals are
+   produced, before the evening push.
+3. **OpenTimestamps / Bitcoin block attestation** (added 2026-07-15) — the
+   same day's `merkle_root` is also submitted to the OpenTimestamps
+   calendar-server network, which anchors it into a Bitcoin block. Unlike
+   the two anchors above, this one is two-phase: the initial stamp is
+   instant, but the full block-confirmed proof usually takes hours to
+   about a day to become available (`ots upgrade`), and is republished
+   here once complete.
+
+Details on each are below.
+
 ## What actually proves the timing
 
 The `committed_at` field inside each commit file is **self-reported** —
@@ -68,6 +92,36 @@ JSON simply has `"tsa_status": "failed"` and no `.tsr`/`.tsq` files. That's a
 disclosed gap, not a bug — a missing token doesn't invalidate the hash
 commitment itself, which stands on its own math regardless.
 
+**Added 2026-07-15 — independent OpenTimestamps (Bitcoin) anchor.** A third,
+independent anchor for the same `merkle_root`, submitted to the
+[OpenTimestamps](https://opentimestamps.org) calendar-server network the
+same day it's computed. Unlike the RFC3161 token above, this one is
+inherently two-phase:
+
+- **Stamp** (instant) — the root is submitted to several public calendar
+  servers, which queue it up for inclusion in an upcoming Bitcoin block.
+  The resulting `ingest/commits/<date>.ots` file is published the same
+  evening as everything else, with `"ots_status": "pending"` in that day's
+  commit JSON.
+- **Upgrade** (hours to ~a day later) — once a Bitcoin block actually
+  includes the calendar servers' aggregate commitment, the `.ots` file can
+  be "upgraded" to embed the full Merkle path proving that block attests to
+  this exact `merkle_root`. This ledger's publish step checks all
+  not-yet-confirmed dates every time it runs and republishes the upgraded
+  `.ots` once available — so a given date's file may start as
+  "pending" and later be replaced with a "confirmed" version carrying the
+  full block proof, at which point `verify.py` (below) reports it as
+  confirmed rather than pending.
+
+This is a genuinely different kind of anchor from the RFC3161 TSA above —
+it doesn't depend on trusting any single organization's signing key at all,
+only on Bitcoin's own proof-of-work chain (which is why it takes longer to
+become final: it's waiting on an actual block, not a TSA's instant
+response). Like the RFC3161 anchor, it's additional and independent — it
+doesn't replace either of the other two, and if a `.ots` file is still
+pending or missing (`"ots_status": "failed"`, a disclosed gap when the
+initial stamp request itself failed), the other two anchors are unaffected.
+
 ## Verifying it yourself
 
 ```
@@ -78,7 +132,8 @@ Pure stdlib for the hash/Merkle checks, no dependency on this repo's
 producer (Hermes, private). Checks:
 - the published Merkle root matches a recomputation from the committed hash list
 - every revealed record's recomputed hash matches both its own commit-time hash and appears in that date's committed hash set
-- **if that date has an RFC3161 token** (`ingest/commits/<date>.tsr` + `.tsr.tsq`): shells out to the system `openssl` binary (`openssl ts -verify`) to confirm it's a valid timestamp response, signed by a publicly-trusted CA, covering exactly that day's `merkle_root`. This is the one external dependency this script has — verifying a cryptographic timestamp requires a certificate-chain-aware tool that Python's stdlib doesn't provide on its own. Install it if you don't have it (`brew install openssl` / `apt install openssl` / etc. — it's on most systems already). If your machine's CA bundle isn't at one of the common paths the script checks, pass `--ca-bundle /path/to/bundle.pem` explicitly. Dates with `tsa_status: "failed"` in their commit JSON won't have a token to check — the script reports that as an expected gap, not a failure.
+- **if that date has an RFC3161 token** (`ingest/commits/<date>.tsr` + `.tsr.tsq`): shells out to the system `openssl` binary (`openssl ts -verify`) to confirm it's a valid timestamp response, signed by a publicly-trusted CA, covering exactly that day's `merkle_root`. This is one of two external dependencies this script has — verifying a cryptographic timestamp requires a certificate-chain-aware tool that Python's stdlib doesn't provide on its own. Install it if you don't have it (`brew install openssl` / `apt install openssl` / etc. — it's on most systems already). If your machine's CA bundle isn't at one of the common paths the script checks, pass `--ca-bundle /path/to/bundle.pem` explicitly. Dates with `tsa_status: "failed"` in their commit JSON won't have a token to check — the script reports that as an expected gap, not a failure.
+- **if that date has an OpenTimestamps proof** (`ingest/commits/<date>.ots`): shells out to the `ots` binary (`pip install opentimestamps-client` — the second external dependency, for the same reason as openssl) to check whether a Bitcoin block already confirms that day's `merkle_root`, or whether it's still pending (normal for anything stamped recently — see the OpenTimestamps section above for why this one is two-phase). Dates with `ots_status: "failed"` won't have a proof to check — same disclosed-gap convention as the RFC3161 check.
 
 ## Status
 
