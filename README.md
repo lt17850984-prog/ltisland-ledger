@@ -1,4 +1,4 @@
-# LTIsland Insight — 信號存證帳本
+# LTIsland Ledger — 信號存證帳本
 
 Verifiable commitment ledger for stock signals produced by the LTIsland
 Insight screening pipeline. Purpose: prove a signal existed at a given time,
